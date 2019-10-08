@@ -60,23 +60,26 @@ func doReduce(
 			return
 		}
 		dec := json.NewDecoder(file)
-		kv := &KeyValue{}
-		err = dec.Decode(&kv)
-		if err != nil {
-			return
+
+		for dec.More() {
+			kv := &KeyValue{}
+			err = dec.Decode(&kv)
+			if err != nil {
+				return
+			}
+			mapping[kv.Key] = append(mapping[kv.Key], kv.Value)
 		}
-		mapping[kv.Key] = append(mapping[kv.Key], kv.Value)
 
 	}
 
 	file, err := os.Create(outFile)
+	enc := json.NewEncoder(file)
 	defer file.Close()
 	for k, v := range mapping {
 		kv := KeyValue{k, reduceF(k, v)}
 		if err != nil {
 			return
 		}
-		enc := json.NewEncoder(file)
 		err = enc.Encode(kv)
 		if err != nil {
 			return

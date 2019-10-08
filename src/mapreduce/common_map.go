@@ -63,21 +63,28 @@ func doMap(
 	}
 
 	kvs := mapF("inFile", string(bytes[:]))
+	mapping := make(map[int][]KeyValue)
 
 	for _, kv := range kvs {
+		hashV := ihash(kv.Key) % nReduce
+		mapping[hashV] = append(mapping[hashV], kv)
+	}
 
-		filename := reduceName(jobName, mapTask, ihash(kv.Key)%nReduce)
+	for hashV, kvs := range mapping {
+		filename := reduceName(jobName, mapTask, hashV)
 		file, err := os.Create(filename)
 		defer file.Close()
 		if err != nil {
 			return
 		}
-
 		enc := json.NewEncoder(file)
-		err = enc.Encode(kv)
-		if err != nil {
-			return
+		for _, kv := range kvs {
+			err = enc.Encode(kv)
+			if err != nil {
+				return
+			}
 		}
+
 	}
 
 }
