@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"mapreduce"
 	"os"
+	"strconv"
+	"strings"
+	"unicode"
 )
 
 //
@@ -15,6 +18,21 @@ import (
 //
 func mapF(filename string, contents string) []mapreduce.KeyValue {
 	// Your code here (Part II).
+
+	//when a character satisfies this condiction, it will be cut,
+	//and previous continous string is append to slice
+	f := func(c rune) bool {
+		return !unicode.IsLetter(c)
+	}
+
+	strs := strings.FieldsFunc(contents, f)
+
+	mapping := make([]mapreduce.KeyValue, 0)
+	for _, str := range strs {
+		mapping = append(mapping, mapreduce.KeyValue{str, "1"})
+	}
+
+	return mapping
 }
 
 //
@@ -24,6 +42,8 @@ func mapF(filename string, contents string) []mapreduce.KeyValue {
 //
 func reduceF(key string, values []string) string {
 	// Your code here (Part II).
+	return strconv.Itoa(len(values))
+
 }
 
 // Can be run in 3 ways:
