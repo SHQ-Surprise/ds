@@ -3,6 +3,7 @@ package mapreduce
 import (
 	"fmt"
 	"sync"
+	"sync/atomic"
 )
 
 //
@@ -28,54 +29,104 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 
 	fmt.Printf("Schedule: %v %v tasks (%d I/Os)\n", ntasks, phase, n_other)
 
-	counter := 0
+	var complete int64
+	var picked int64
 	m := &sync.Mutex{}
 	var wg sync.WaitGroup
-	files := make(chan string, 1)
+	files := make(chan string, len(mapFiles))
+	indexs := make(chan int, ntasks)
 	if phase == mapPhase {
-		go func() {
-			for _, file := range mapFiles {
-				files <- file
-			}
-		}()
+		// go func() {
+		// 	for i, file := range mapFiles {
+		// 		files <- file
+		// 		indexs <- i
+		// 	}
+		// }()
+		for i, file := range mapFiles {
+			files <- file
+			indexs <- i
+		}
+	} else {
+		// go func() {
+		// 	for i := 0; i < ntasks; i++ {
+		// 		indexs <- i
+		// 	}
+		// }()
+		for i := 0; i < ntasks; i++ {
+			indexs <- i
+		}
 	}
 
 	workers := make(chan string, ntasks)
 
 	for {
-		if counter == ntasks {
+		if int(complete) == ntasks {
 			break
+		}
+		if int(picked) == ntasks {
+			continue
 		}
 		select {
 		case workerAddr := <-registerChan:
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				m.Lock()
-				index := counter
-				counter++
-				m.Unlock()
 				if phase == mapPhase {
-					call(workerAddr, "Worker.DoTask", DoTaskArgs{jobName, <-files, phase, index, n_other}, nil)
+					m.Lock()
+					file := <-files
+					index := <-indexs
+					m.Unlock()
+					atomic.AddInt64(&picked, 1)
+					if call(workerAddr, "Worker.DoTask", DoTaskArgs{jobName, file, phase, index, n_other}, nil) == true {
+						atomic.AddInt64(&complete, 1)
+					} else {
+						m.Lock()
+						files <- file
+						indexs <- index
+						m.Unlock()
+						atomic.AddInt64(&picked, -1)
+					}
 				} else {
-					call(workerAddr, "Worker.DoTask", DoTaskArgs{jobName, "", phase, index, n_other}, nil)
+					index := <-indexs
+					atomic.AddInt64(&picked, 1)
+					if call(workerAddr, "Worker.DoTask", DoTaskArgs{jobName, "", phase, index, n_other}, nil) == true {
+						atomic.AddInt64(&complete, 1)
+					} else {
+						indexs <- index
+						atomic.AddInt64(&picked, -1)
+					}
 				}
 				workers <- workerAddr
-
 			}()
 
 		case workerAddr := <-workers:
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				m.Lock()
-				index := counter
-				counter++
-				m.Unlock()
 				if phase == mapPhase {
-					call(workerAddr, "Worker.DoTask", DoTaskArgs{jobName, <-files, phase, index, n_other}, nil)
+					m.Lock()
+					file := <-files
+					index := <-indexs
+					m.Unlock()
+					atomic.AddInt64(&picked, 1)
+					if call(workerAddr, "Worker.DoTask", DoTaskArgs{jobName, file, phase, index, n_other}, nil) == true {
+						atomic.AddInt64(&complete, 1)
+					} else if int(complete) < ntasks {
+						m.Lock()
+						files <- file
+						indexs <- index
+						m.Unlock()
+						atomic.AddInt64(&picked, -1)
+					}
 				} else {
-					call(workerAddr, "Worker.DoTask", DoTaskArgs{jobName, "", phase, index, n_other}, nil)
+					index := <-indexs
+					atomic.AddInt64(&picked, 1)
+					if call(workerAddr, "Worker.DoTask", DoTaskArgs{jobName, "", phase, index, n_other}, nil) == true {
+						atomic.AddInt64(&complete, 1)
+					} else if int(complete) < ntasks {
+						indexs <- index
+						atomic.AddInt64(&picked, -1)
+					}
 				}
 				workers <- workerAddr
 			}()
@@ -83,6 +134,7 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 	}
 
 	close(files)
+	close(indexs)
 	wg.Wait()
 
 	// All ntasks tasks have to be scheduled on workers. Once all tasks
