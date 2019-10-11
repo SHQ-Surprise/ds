@@ -15,6 +15,9 @@ import (
 // suitable for passing to call(). registerChan will yield all
 // existing registered workers (if any) and new ones as they register.
 //
+
+//golang经验：从没有值的open channel读数据，会阻塞。但是从没有值close的channel读数据，
+//不会阻塞，而是读出空值，此时需要用 v,ok := <- channel， 若ok==false则已经close了
 func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, registerChan chan string) {
 	var ntasks int
 	var n_other int // number of inputs (for reduce) or outputs (for map)
@@ -29,113 +32,118 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 
 	fmt.Printf("Schedule: %v %v tasks (%d I/Os)\n", ntasks, phase, n_other)
 
-	var complete int64
-	var picked int64
 	m := &sync.Mutex{}
 	var wg sync.WaitGroup
-	files := make(chan string, len(mapFiles))
-	indexs := make(chan int, ntasks)
+	msgs := make(chan msg, ntasks)
+	var complete int64
+
+	//input tasks
+	wg.Add(1)
 	if phase == mapPhase {
-		// go func() {
-		// 	for i, file := range mapFiles {
-		// 		files <- file
-		// 		indexs <- i
-		// 	}
-		// }()
-		for i, file := range mapFiles {
-			files <- file
-			indexs <- i
-		}
+		go func() {
+			defer wg.Done()
+			for i, file := range mapFiles {
+				info := msg{file, i}
+				msgs <- info
+			}
+		}()
 	} else {
-		// go func() {
-		// 	for i := 0; i < ntasks; i++ {
-		// 		indexs <- i
-		// 	}
-		// }()
-		for i := 0; i < ntasks; i++ {
-			indexs <- i
-		}
+		go func() {
+			defer wg.Done()
+			for i := 0; i < ntasks; i++ {
+				info := msg{index: i}
+				msgs <- info
+			}
+		}()
+
 	}
 
-	workers := make(chan string, ntasks)
+	idle := make(chan int, ntasks)
+	signals := make([]chan msg, 0)
+	done := make(chan bool, 1)
 
+	//schedule
+	wg.Add(1)
+	go func() {
+		wg.Done()
+		for {
+			select {
+			case <-done:
+				return
+			case msg, good := <-msgs:
+				if good == false {
+					return
+				}
+			Loop:
+				for {
+					select {
+					case <-done:
+						return
+					case id, ok := <-idle:
+						if ok == false {
+							return
+						}
+						signals[id] <- msg
+						break Loop
+					}
+				}
+			}
+		}
+	}()
+
+	counter := 0
+Loop:
 	for {
-		if int(complete) == ntasks {
-			break
-		}
-		if int(picked) == ntasks {
-			continue
-		}
 		select {
-		case workerAddr := <-registerChan:
+		case <-done:
+			break Loop
+		case workerAddr, good := <-registerChan:
+			if good == false {
+				break Loop
+			}
+			signals = append(signals, make(chan msg, 1))
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				if phase == mapPhase {
-					m.Lock()
-					file := <-files
-					index := <-indexs
-					m.Unlock()
-					atomic.AddInt64(&picked, 1)
-					if call(workerAddr, "Worker.DoTask", DoTaskArgs{jobName, file, phase, index, n_other}, nil) == true {
-						atomic.AddInt64(&complete, 1)
-					} else {
-						m.Lock()
-						files <- file
-						indexs <- index
-						m.Unlock()
-						atomic.AddInt64(&picked, -1)
-					}
-				} else {
-					index := <-indexs
-					atomic.AddInt64(&picked, 1)
-					if call(workerAddr, "Worker.DoTask", DoTaskArgs{jobName, "", phase, index, n_other}, nil) == true {
-						atomic.AddInt64(&complete, 1)
-					} else {
-						indexs <- index
-						atomic.AddInt64(&picked, -1)
-					}
-				}
-				workers <- workerAddr
-			}()
+				addr := workerAddr
+				m.Lock()
+				id := counter
+				counter++
+				m.Unlock()
+				idle <- id
 
-		case workerAddr := <-workers:
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				if phase == mapPhase {
-					m.Lock()
-					file := <-files
-					index := <-indexs
-					m.Unlock()
-					atomic.AddInt64(&picked, 1)
-					if call(workerAddr, "Worker.DoTask", DoTaskArgs{jobName, file, phase, index, n_other}, nil) == true {
-						atomic.AddInt64(&complete, 1)
-					} else if int(complete) < ntasks {
-						m.Lock()
-						files <- file
-						indexs <- index
-						m.Unlock()
-						atomic.AddInt64(&picked, -1)
-					}
-				} else {
-					index := <-indexs
-					atomic.AddInt64(&picked, 1)
-					if call(workerAddr, "Worker.DoTask", DoTaskArgs{jobName, "", phase, index, n_other}, nil) == true {
-						atomic.AddInt64(&complete, 1)
-					} else if int(complete) < ntasks {
-						indexs <- index
-						atomic.AddInt64(&picked, -1)
+				for {
+					select {
+					case <-done:
+						return
+					case msg, ok := <-signals[id]:
+						if ok == false {
+							return
+						}
+						if call(addr, "Worker.DoTask", DoTaskArgs{jobName, msg.file, phase, msg.index, n_other}, nil) == true {
+							idle <- id
+							atomic.AddInt64(&complete, 1)
+							if int(complete) == ntasks {
+								close(done)
+							}
+						} else {
+							msgs <- msg
+							idle <- id
+						}
+
 					}
 				}
-				workers <- workerAddr
+
 			}()
 		}
 	}
 
-	close(files)
-	close(indexs)
 	wg.Wait()
+	close(msgs)
+	close(idle)
+	for _, signal := range signals {
+		close(signal)
+	}
 
 	// All ntasks tasks have to be scheduled on workers. Once all tasks
 	// have completed successfully, schedule() should return.
@@ -143,4 +151,9 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 	// Your code here (Part III, Part IV).
 	//
 	fmt.Printf("Schedule: %v done\n", phase)
+}
+
+type msg struct {
+	file  string
+	index int
 }
